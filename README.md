@@ -24,7 +24,8 @@ end
 ------------------------------------------------------------------------
 local FONT = Enum.Font.SourceSansSemibold -- шрифт с кириллицей
 local STUDS_TO_KMH = 1.008 -- студы/сек -> км/ч (если спидометр игры показывает иначе, подправь)
-local ACCEL_BOOST = 0.09 -- сила добавки к разгону (доля от максималки в студах/сек²)
+local TOP_ACCEL = 14 -- добавка при зажатом газе до предела скорости, студы/сек² (базовая сила)
+local MAX_EXTRA = 160 -- потолок общей добавки, студы/сек²
 
 local COLOR_BODY = Color3.fromRGB(138, 142, 150)
 local COLOR_HEADER = Color3.fromRGB(116, 120, 128)
@@ -41,7 +42,8 @@ local state = {
 	boost = false,
 	susp = false,
 	height = 0, -- % к высоте пружин
-	boostKmh = 8, -- прибавка к максималке, км/ч
+	accel = 30, -- сила ускорения, 0-100
+	top = 40, -- сила максимальной скорости, 0-100 (0 = выкл)
 	stiff = 100, -- жёсткость, %
 	damp = 100, -- демпфирование, %
 }
@@ -50,7 +52,6 @@ local alive = true
 local connections = {}
 local car = nil
 local ignoredSeat = nil
-local peakCache = setmetatable({}, { __mode = "k" })
 
 local function connect(signal, fn)
 	local c = signal:Connect(fn)
@@ -158,10 +159,9 @@ local function refreshCar()
 		count = 0,
 		h = 1,
 		touched = false,
-		prev = 0,
-		accel = 0,
-		still = 0,
-		peak = peakCache[model],
+		gain = 0,
+		pushedAt = 0,
+		fwdSign = 1,
 	}
 	for _, d in ipairs(model:GetDescendants()) do
 		if d:IsA("SpringConstraint") then
@@ -175,6 +175,10 @@ local function refreshCar()
 			}
 			c.count = c.count + 1
 		end
+	end
+	local tv = model:FindFirstChild("Throttle", true)
+	if tv and (tv:IsA("NumberValue") or tv:IsA("IntValue")) then
+		c.throttleValue = tv
 	end
 	car = c
 end
@@ -217,19 +221,26 @@ end
 ------------------------------------------------------------------------
 -- БУСТЕР
 ------------------------------------------------------------------------
-local rayParams = RaycastParams.new()
-rayParams.FilterType = Enum.RaycastFilterType.Exclude
-
-local function onGround(c, root)
-	rayParams.FilterDescendantsInstances = { c.model, LocalPlayer.Character }
-	return workspace:Raycast(root.Position, Vector3.new(0, -9, 0), rayParams) ~= nil
+-- Бустер:
+-- 1) разгон: к набору скорости машины добавляем ещё (разгон% - 100%) от него;
+-- 2) макс. скорость: пока газ зажат и скорость ниже предела, подталкиваем вперёд.
+local function lookFlat(seat)
+	local l = seat.CFrame.LookVector
+	local f = Vector3.new(l.X, 0, l.Z)
+	if f.Magnitude < 0.05 then
+		return nil
+	end
+	return f.Unit
 end
 
-local function throttleHeld(seat)
+local function throttleHeld(c)
 	if UserInputService:GetFocusedTextBox() then
 		return false
 	end
-	if seat:IsA("VehicleSeat") and seat.ThrottleFloat > 0.1 then
+	if c.seat:IsA("VehicleSeat") and c.seat.ThrottleFloat > 0.1 then
+		return true
+	end
+	if c.throttleValue and c.throttleValue.Parent and c.throttleValue.Value > 0.1 then
 		return true
 	end
 	return UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up)
@@ -237,55 +248,83 @@ end
 
 local function updateBoost(dt)
 	local c = car
-	local seat = c.seat
-	local root = seat.AssemblyRootPart
+	local root = c.seat.AssemblyRootPart
 	if not root or root.Anchored then
+		c.expected = nil
 		return
 	end
 
 	local vel = root.AssemblyLinearVelocity
 	local flat = Vector3.new(vel.X, 0, vel.Z)
 	local speed = flat.Magnitude
-	local throttle = throttleHeld(seat)
-	local forward = speed > 1 and flat:Dot(seat.CFrame.LookVector) > speed * 0.4
 
-	-- скрипт сам запоминает максималку машины: газ зажат, скорость перестала расти
-	local accel = (speed - c.prev) / math.max(dt, 1 / 240)
-	c.prev = speed
-	c.accel = c.accel + (accel - c.accel) * math.min(1, dt * 8)
+	if c.expected == nil or dt > 0.1 then
+		c.expected = speed
+		c.gain = 0
+		return
+	end
 
-	local boostStuds = state.boostKmh / STUDS_TO_KMH
-	local naturalOver = state.boost and c.peak ~= nil and speed > c.peak + boostStuds + 3
-	local learning = (not state.boost) or c.peak == nil or naturalOver
-	if learning and throttle and forward and speed > 15 and math.abs(c.accel) < 1.5 then
-		c.still = c.still + dt
-		if c.still > 0.6 and (c.peak == nil or speed > c.peak) then
-			c.peak = speed
-			peakCache[c.model] = speed
+	-- набор скорости машины без нашей добавки (студы/сек²), сглаженный
+	local gainPerSec = (speed - c.expected) / math.max(dt, 1 / 240)
+	c.gain = c.gain + (gainPerSec - c.gain) * math.min(1, dt * 12)
+	c.expected = speed
+
+	if not state.boost then
+		return
+	end
+
+	local throttle = throttleHeld(c)
+	local look = lookFlat(c.seat)
+	local moveDir = speed > 0.5 and (flat / speed) or nil
+
+	-- в какую сторону у этой машины «вперёд»
+	if throttle and look and moveDir and c.gain > 3 and speed > 5 then
+		local d = moveDir:Dot(look)
+		if math.abs(d) > 0.5 then
+			c.fwdSign = d > 0 and 1 or -1
 		end
-	else
-		c.still = 0
 	end
 
-	if not state.boost or not c.peak or not throttle or not forward then
-		return
+	-- куда толкать
+	local pushDir = nil
+	if speed > 2 then
+		pushDir = flat / speed
+	elseif look then
+		pushDir = look * c.fwdSign
+	elseif moveDir then
+		pushDir = moveDir
 	end
-	if boostStuds < 0.1 or speed < 3 then
+
+	local extra = 0
+
+	-- 1) быстрее разгон
+	if moveDir then
+		extra = (state.accel * 0.07) * math.max(0, c.gain - 0.5)
+	end
+
+	-- 2) выше максималка
+	if throttle then
+		local forwardOk = true
+		if moveDir and look then
+			forwardOk = moveDir:Dot(look) * c.fwdSign > 0.3
+		end
+		if state.top > 0 and forwardOk then
+			local ceiling = (60 + state.top * 3.4) / STUDS_TO_KMH -- 100 = около 400 км/ч
+			if speed < ceiling then
+				local taper = math.clamp((ceiling - speed) / (ceiling * 0.12), 0, 1)
+				extra = extra + TOP_ACCEL * (1 + state.accel * 0.06) * taper
+			end
+		end
+	end
+
+	extra = math.min(extra, MAX_EXTRA)
+	if extra <= 0 or not pushDir then
 		return
 	end
 
-	local ceiling = c.peak + boostStuds
-	if speed >= ceiling then
-		return
-	end
-	if not onGround(c, root) then
-		return
-	end
-
-	-- мягкая добавка вдоль движения; к потолку затухает
-	local headroom = math.clamp((ceiling - speed) / math.max(boostStuds, 3), 0, 1)
-	local acc = c.peak * ACCEL_BOOST * headroom
-	root.AssemblyLinearVelocity = vel + (flat / speed) * acc * dt
+	root:ApplyImpulse(pushDir * root.AssemblyMass * extra * dt)
+	c.expected = speed + extra * dt
+	c.pushedAt = os.clock()
 end
 
 connect(RunService.Heartbeat, function(dt)
@@ -640,6 +679,55 @@ local function makeSlider(page, y, titleText, minV, maxV, initV, suffix, onChang
 	return { set = setValue }
 end
 
+-- поле ввода числа 0-100
+local function makeField(page, y, labelText, initV, onChange)
+	local lbl = newInstance("TextLabel", {
+		Position = UDim2.fromOffset(0, y),
+		Size = UDim2.new(1, -80, 0, 28),
+		BackgroundTransparency = 1,
+		Text = labelText,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, page)
+	styleText(lbl, 18)
+
+	local box = newInstance("TextBox", {
+		Position = UDim2.new(1, -70, 0, y + 1),
+		Size = UDim2.fromOffset(70, 26),
+		BackgroundColor3 = COLOR_WHITE,
+		BackgroundTransparency = 0.82,
+		Text = tostring(initV),
+		PlaceholderText = "0-100",
+		PlaceholderColor3 = Color3.fromRGB(225, 225, 225),
+		ClearTextOnFocus = false,
+	}, page)
+	styleText(box, 18)
+	corner(box, 6)
+	outline(box, 1.5)
+
+	local value = initV
+
+	-- пока печатаешь: только цифры, не больше трёх
+	connect(box:GetPropertyChangedSignal("Text"), function()
+		local clean = box.Text:gsub("%D", "")
+		if #clean > 3 then
+			clean = clean:sub(1, 3)
+		end
+		if clean ~= box.Text then
+			box.Text = clean
+		end
+	end)
+
+	-- когда закончил: число зажимается в 0-100, пустое возвращает прежнее
+	connect(box.FocusLost, function()
+		local n = tonumber(box.Text)
+		if n then
+			value = math.clamp(math.floor(n + 0.5), 0, 100)
+			onChange(value)
+		end
+		box.Text = tostring(value)
+	end)
+end
+
 -- белая кнопка
 local function makeButton(parent, text, pos, size, onClick)
 	local b = newInstance("TextButton", {
@@ -693,11 +781,14 @@ local statusPneumo = makeInfo(pagePneumo, 128, 20, 15)
 -- вкладка 2: БУСТЕР
 local pageBoost = newTab(2, "БУСТЕР")
 makeToggle(pageBoost, 0, "Бустер", "boost")
-makeSlider(pageBoost, 38, "Прибавка", 0, 40, state.boostKmh, " км/ч", function(v)
-	state.boostKmh = v
+makeField(pageBoost, 40, "Ускорение", state.accel, function(v)
+	state.accel = v
 end)
-local peakLabel = makeInfo(pageBoost, 92, 20, 16)
-makeInfo(pageBoost, 114, 36, 14).Text = "Разгонись до максималки один раз — скрипт запомнит её для этой машины."
+makeField(pageBoost, 76, "Макс. скорость", state.top, function(v)
+	state.top = v
+end)
+makeInfo(pageBoost, 110, 18, 14).Text = "Введи число от 0 до 100 (0 — выключено)"
+local boostStatus = makeInfo(pageBoost, 132, 18, 15)
 
 -- вкладка 3: Подвеска
 local pageSusp = newTab(3, "Подвеска")
@@ -720,12 +811,11 @@ task.spawn(function()
 		statusPneumo.Text = msg
 		statusSusp.Text = msg
 
-		local peak = car and car.peak
-		if peak then
-			peakLabel.Text = "Максималка: " .. tostring(math.floor(peak * STUDS_TO_KMH + 0.5)) .. " км/ч"
-		else
-			peakLabel.Text = "Максималка: не определена"
+		local boostMsg = ""
+		if car and state.boost then
+			boostMsg = (os.clock() - car.pushedAt < 0.3) and "Разгон применяется" or "Жми газ"
 		end
+		boostStatus.Text = boostMsg
 		task.wait(0.25)
 	end
 end)
